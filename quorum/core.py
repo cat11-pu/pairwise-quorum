@@ -22,7 +22,11 @@ def make_version(counter, coordinator_id):
 
 def _compare_version(a, b):
     """版本号比较：返回正数表示 a 更新，负数表示 a 更旧，0 表示相同。"""
-    return a[0] - b[0]
+    if a[0] != b[0]:
+        return a[0] - b[0]
+    if a[1] == b[1]:
+        return 0
+    return 1 if a[1] > b[1] else -1
 
 
 class Clock:
@@ -165,6 +169,7 @@ class Quorum:
         self.queue = queue if queue is not None else MessageQueue(self.clock)
         self._validate()
         self._op_id = 0
+        self._counter = -1
         self._acks = []
         self._responses = {}
 
@@ -177,7 +182,7 @@ class Quorum:
             raise ValueError("W 必须落在 1..N 之间")
         if not 1 <= self.r <= self.n:
             raise ValueError("R 必须落在 1..N 之间")
-        if self.r + self.w < self.n:
+        if self.r + self.w <= self.n:
             raise ValueError("R + W 必须大于 N，否则读写集合可能不相交")
 
     def replica(self, node_id):
@@ -222,8 +227,8 @@ class Quorum:
         for node in targets:
             self._send("write", node.node_id, key=key, version=version, value=value)
         deadline = self.clock.now() + self.timeout
-        self._pump_until(lambda: len(self._acks) >= len(targets), deadline)
-        if len(self._acks) < self.w - 1:
+        self._pump_until(lambda: len(self._acks) >= self.w, deadline)
+        if len(self._acks) < self.w:
             self._abort_write(key, version, prev)
             return False
         return True
@@ -236,7 +241,7 @@ class Quorum:
             self._send("read", node.node_id, key=key)
         deadline = self.clock.now() + self.timeout
         self._pump_until(lambda: len(self._responses) >= len(targets), deadline)
-        if not self._has_majority(len(self._responses)):
+        if len(self._responses) < self.r:
             return None
         best = self._pick_latest(self._responses)
         if best is None:
@@ -249,11 +254,15 @@ class Quorum:
 
     def _next_version(self):
         """生成下一个版本号。"""
-        return make_version(self.clock.now(), self.coordinator_id)
-
-    def _has_majority(self, count):
-        """确认数或响应数是否达到多数派。"""
-        return count > self.n // 2 + 1
+        counter = self.clock.now()
+        for node in self.replicas:
+            for entry in node.data.values():
+                if entry[0][0] > counter:
+                    counter = entry[0][0]
+        if counter <= self._counter:
+            counter = self._counter + 1
+        self._counter = counter
+        return make_version(counter, self.coordinator_id)
 
     def _begin_op(self):
         self._op_id += 1
@@ -317,10 +326,12 @@ class Quorum:
     def _read_repair(self, key, version, value, responses):
         """把最新版本回灌给落后的副本。"""
         stale = []
-        for node_id in sorted(responses):
-            entry = responses[node_id]
-            if entry is not None and _compare_version(entry[0], version) < 0:
-                stale.append(node_id)
+        for node in self.replicas:
+            if not node.up:
+                continue
+            entry = responses.get(node.node_id)
+            if entry is None or _compare_version(entry[0], version) < 0:
+                stale.append(node.node_id)
         for node_id in stale:
             self._send("repair", node_id, key=key, version=version, value=value)
         if stale:
@@ -329,15 +340,24 @@ class Quorum:
 
     def _abort_write(self, key, version, prev):
         """回滚失败的写入：把已确认的副本恢复成写入前的样子。"""
-        for node_id in self._acks:
-            self.replica(node_id).restore(key, prev.get(node_id))
+        self.queue.cancel(
+            lambda m: m.op_id == self._op_id and m.kind in ("write", "ack"))
+        for node in self.replicas:
+            entry = node.get(key)
+            if entry is not None and _compare_version(entry[0], version) == 0:
+                node.restore(key, prev.get(node.node_id))
 
     def _anti_entropy(self, node):
         """反熵：把本副本的数据与其它在线副本对齐。"""
+        latest = {}
         for peer in self.replicas:
             if peer is node or not peer.up:
                 continue
-            for key, entry in node.snapshot().items():
-                latest = peer.get(key)
-                if latest is not None and _compare_version(latest[0], entry[0]) > 0:
-                    node.put(key, latest[0], latest[1])
+            for key, entry in peer.snapshot().items():
+                cur = latest.get(key)
+                if cur is None or _compare_version(entry[0], cur[0]) > 0:
+                    latest[key] = entry
+        for key, entry in latest.items():
+            cur = node.get(key)
+            if cur is None or _compare_version(entry[0], cur[0]) > 0:
+                node.put(key, entry[0], entry[1])
